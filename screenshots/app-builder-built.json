@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": true,
+      "bodyTextLen": 439,
+      "bodyTextHash": "231d1ae57014d5cc3a95a488e93cf6174a605cbb7cd2e412faba233e9e63ba9c",
+      "bodyTextPrefix": "STAR ATLAS · GALIA ONI · Akenat Карта Экипаж Флот Рынок Сейф Арх",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": true,
+      "bodyTextLen": 182,
+      "bodyTextHash": "36ac15f0a6428e07c7e1a3e2606843c777ee038bd317544370347e9b329f100f",
+      "bodyTextPrefix": "STAR ATLAS · GALIA ONI · Akenat Системы Места СТАНЦИЯ · ОРБИТА O",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}

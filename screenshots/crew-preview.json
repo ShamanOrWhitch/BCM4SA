@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/crew",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": false,
+      "bodyTextLen": 8015,
+      "bodyTextHash": "3ea8b6150c2fc188f383fe26e50c8a3211065413b5759c4bcc114c79100ac093",
+      "bodyTextPrefix": "STAR ATLAS · КРИО Экипаж · 68 Алмаз Архив Карта Экипаж Флот ДВЕ ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/crew-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": false,
+      "bodyTextLen": 7089,
+      "bodyTextHash": "06de8b9f9b8490120ab9b56b1ae8d570eee7f3bb91c50ad3479d1922cfe7e7ed",
+      "bodyTextPrefix": "STAR ATLAS · КРИО Экипаж · 68 Фильтр Все Tensor золото Command А",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/crew-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/crew-preview.json"
+}

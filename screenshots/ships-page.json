@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/ships",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": false,
+      "bodyTextLen": 627,
+      "bodyTextHash": "56358b471b7251d2f06903e2db25ff05422f5e0a4106ab6fc75d1c92b063dd82",
+      "bodyTextPrefix": "GALACTIC MARKET · ОФИЦИАЛЬНЫЕ ГАЛЕРЕИ Флот Карта Экипаж Флот Все",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/ships-page.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Galia Crew Bay",
+      "hasCanvas": false,
+      "bodyTextLen": 627,
+      "bodyTextHash": "eaf2056075001d248fcb359d28ee42c01383798769f0f890ba78ea91a8d9778e",
+      "bodyTextPrefix": "GALACTIC MARKET · ОФИЦИАЛЬНЫЕ ГАЛЕРЕИ Флот Все 15 XXS 4–8 м · 4 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/ships-page-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/ships-page.json"
+}
