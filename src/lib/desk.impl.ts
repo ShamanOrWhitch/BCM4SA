@@ -1,10 +1,11 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import type { Candle, FleetPeek, MarketSnap, ProfilePeek, ResourceRow, TapePoint, TokenQuote, WalletItem, WalletScan, WalletTrait } from "./desk-types";
+import type { BookLevel, Candle, FleetPeek, MarketShip, MarketSnap, ProfilePeek, ResourceRow, TapePoint, TokenQuote, WalletItem, WalletScan, WalletTrait } from "./desk-types";
 
 const RPC_URL = "https://api.mainnet-beta.solana.com";
 const GM = "traderDnaR5w6Tcoi3NFm53i48FTDNbGjBSZwWXDRrg";
 const ATLAS = "ATLASXmbPQxBUYbxPsV97usA3fPQYEqzQBUHgiFCUsXx";
 const POLIS = "poLisWXnNRwC6oBu1vHiuKQzFjGL4XDSu4g9qjz9qVk";
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const META = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
@@ -19,7 +20,7 @@ const CLASS_KEEP = new Set([
   "data",
 ]);
 
-type BookSide = { ask: number | null; bid: number | null; askQty: number };
+type BookSide = { ask: number | null; bid: number | null; askQty: number; asks: BookLevel[]; bids: BookLevel[] };
 type CatItem = {
   mint: string;
   name: string;
@@ -29,6 +30,12 @@ type CatItem = {
   rarity: string;
   spec: string;
   image: string;
+  description: string;
+  gallery: string[];
+  make: string;
+  crew: number;
+  slots: string[];
+  msrp: number | null;
 };
 
 let marketCache: { at: number; data: MarketSnap } | null = null;
@@ -75,50 +82,122 @@ async function loadCatalog(): Promise<Map<string, CatItem>> {
     if (!mint) continue;
     const attrs = (row.attributes ?? {}) as Record<string, unknown>;
     const itemType = String(attrs.itemType ?? "");
+    const media = (row.media ?? {}) as { gallery?: unknown };
+    const slots = (row.slots ?? {}) as { crewSlots?: Array<{ type?: string; quantity?: number }> };
+    const crewSlots = Array.isArray(slots.crewSlots) ? slots.crewSlots : [];
+    const trade = (row.tradeSettings ?? {}) as { msrp?: { value?: number } };
+    const gallery = Array.isArray(media.gallery) ? media.gallery.filter((item): item is string => typeof item === "string").slice(0, 8) : [];
     byMint.set(mint, {
       mint,
       name: String(row.name ?? mint.slice(0, 4)),
       symbol: String(row.symbol ?? ""),
       kind: kindOf(itemType),
-      className: String(attrs.class ?? ""),
+      className: String(attrs.class ?? "").toLowerCase(),
       rarity: String(attrs.rarity ?? ""),
       spec: String(attrs.spec ?? ""),
       image: String(row.image ?? ""),
+      description: String(row.description ?? "").replace(/\s+/g, " ").slice(0, 420),
+      gallery,
+      make: String(attrs.make ?? ""),
+      crew: crewSlots.reduce((sum, slot) => sum + (Number(slot.quantity) || 0), 0),
+      slots: crewSlots.flatMap((slot) => Array.from({ length: Math.max(1, Number(slot.quantity) || 1) }, () => String(slot.type ?? "слот"))),
+      msrp: typeof trade.msrp?.value === "number" ? trade.msrp.value : null,
     });
   }
   catalogCache = { at: Date.now(), byMint };
   return byMint;
 }
 
-function readBook(rows: ReadonlyArray<{ account: { data: Uint8Array } }>, atlasHex: string): Map<string, BookSide> {
-  const book = new Map<string, BookSide>();
+function readBook(
+  rows: ReadonlyArray<{ account: { data: Uint8Array } }>,
+  mintHex: string,
+  decimals: number,
+): Map<string, BookSide> {
+  const bags = new Map<string, { asks: BookLevel[]; bids: BookLevel[] }>();
+  const scale = 10 ** decimals;
   for (const row of rows) {
     const raw = Buffer.from(row.account.data);
     if (raw.length < 153) continue;
-    if (raw.subarray(0, 32).toString("hex") !== atlasHex) continue;
+    if (raw.subarray(0, 32).toString("hex") !== mintHex) continue;
     const asset = new PublicKey(raw.subarray(32, 64)).toBase58();
     const side = raw[128];
-    const price = Number(raw.readBigUInt64LE(129)) / 1e8;
-    const rem = Number(raw.readBigUInt64LE(145));
-    if (!Number.isFinite(price) || price <= 0 || rem <= 0) continue;
-    let slot = book.get(asset);
-    if (!slot) {
-      slot = { ask: null, bid: null, askQty: 0 };
-      book.set(asset, slot);
+    const price = Number(raw.readBigUInt64LE(129)) / scale;
+    const qty = Number(raw.readBigUInt64LE(145));
+    if (!Number.isFinite(price) || price <= 0 || qty <= 0) continue;
+    let bag = bags.get(asset);
+    if (!bag) {
+      bag = { asks: [], bids: [] };
+      bags.set(asset, bag);
     }
-    if (side === 1 && (slot.ask == null || price < slot.ask)) {
-      slot.ask = price;
-      slot.askQty = rem;
-    } else if (side === 0 && (slot.bid == null || price > slot.bid)) {
-      slot.bid = price;
-    }
+    if (side === 1) bag.asks.push({ price, qty });
+    else if (side === 0) bag.bids.push({ price, qty });
+  }
+  const book = new Map<string, BookSide>();
+  for (const [asset, bag] of bags) {
+    const asks = bag.asks.sort((a, b) => a.price - b.price).slice(0, 8);
+    const bids = bag.bids.sort((a, b) => b.price - a.price).slice(0, 8);
+    book.set(asset, {
+      ask: asks[0]?.price ?? null,
+      bid: bids[0]?.price ?? null,
+      askQty: asks[0]?.qty ?? 0,
+      asks,
+      bids,
+    });
   }
   return book;
 }
 
-async function atlasCandles(): Promise<Candle[]> {
+async function krakenCandles(pair: string): Promise<Candle[]> {
   try {
-    const rows = await getJson<unknown[][]>("https://api.mexc.com/api/v3/klines?symbol=ATLASUSDT&interval=4h&limit=42");
+    const data = await getJson<{ result?: Record<string, unknown> }>(
+      `https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=1440`,
+    );
+    const rows = Object.values(data.result ?? {}).find((value) => Array.isArray(value)) as unknown[][] | undefined;
+    if (!rows) return [];
+    return rows
+      .slice(-180)
+      .map((row) => ({
+        t: Number(row[0]) * 1000,
+        o: Number(row[1]),
+        h: Number(row[2]),
+        l: Number(row[3]),
+        c: Number(row[4]),
+      }))
+      .filter((candle) => Number.isFinite(candle.c) && candle.c > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function poolCandles(pool: string): Promise<Candle[]> {
+  try {
+    const data = await getJson<{ data?: { attributes?: { ohlcv_list?: number[][] } } }>(
+      `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/day?aggregate=1&limit=180`,
+    );
+    const rows = data.data?.attributes?.ohlcv_list ?? [];
+    return rows
+      .map((row) => ({ t: Number(row[0]), o: Number(row[1]), h: Number(row[2]), l: Number(row[3]), c: Number(row[4]) }))
+      .filter((row) => Number.isFinite(row.c) && row.c > 0)
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+function ratioCandles(base: Candle[], quote: Candle[]): Candle[] {
+  const byDay = new Map(quote.map((row) => [Math.floor(row.t / 86_400), row]));
+  return base.flatMap((row) => {
+    const other = byDay.get(Math.floor(row.t / 86_400));
+    if (!other || other.o <= 0 || other.c <= 0) return [];
+    return [{ t: row.t, o: row.o / other.o, h: row.h / other.l, l: row.l / other.h, c: row.c / other.c }];
+  });
+}
+
+async function atlasCandles(): Promise<Candle[]> {
+  const kraken = await krakenCandles("ATLASUSD");
+  if (kraken.length > 2) return kraken;
+  try {
+    const rows = await getJson<unknown[][]>("https://api.mexc.com/api/v3/klines?symbol=ATLASUSDT&interval=4h&limit=48");
     return rows
       .map((row) => ({
         t: Number(row[0]),
@@ -150,53 +229,84 @@ function pushTape(resources: ResourceRow[]): TapePoint[] {
 export async function buildMarket(): Promise<MarketSnap> {
   if (marketCache && Date.now() - marketCache.at < MARKET_TTL) return marketCache.data;
   const atlasHex = new PublicKey(ATLAS).toBuffer().toString("hex");
-  const [nfts, atlasTok, polisTok, prices, orders, candles] = await Promise.all([
+  const usdcHex = new PublicKey(USDC).toBuffer().toString("hex");
+  const polisHex = new PublicKey(POLIS).toBuffer().toString("hex");
+  const bookArgs = (mint: string) => ({
+    commitment: "confirmed" as const,
+    dataSlice: { offset: 40, length: 153 },
+    filters: [{ dataSize: 201 }, { memcmp: { offset: 40, bytes: mint } }],
+  });
+  const [nfts, atlasTok, polisTok, prices, orders, usdcOrders, polisOrders, candles, polisCandles, atlasPool, polisPool] = await Promise.all([
     loadCatalog(),
     getJson<Record<string, number | string>>("https://galaxy.staratlas.com/tokens/atlas").catch(() => null),
     getJson<Record<string, number | string>>("https://galaxy.staratlas.com/tokens/polis").catch(() => null),
     getJson<Record<string, { usdPrice?: number; priceChange24h?: number }>>(
       `https://lite-api.jup.ag/price/v3?ids=${ATLAS},${POLIS}`,
     ).catch(() => ({}) as Record<string, { usdPrice?: number; priceChange24h?: number }>),
-    connection.getProgramAccounts(new PublicKey(GM), {
-      commitment: "confirmed",
-      dataSlice: { offset: 40, length: 153 },
-      filters: [{ dataSize: 201 }, { memcmp: { offset: 40, bytes: ATLAS } }],
-    }),
+    connection.getProgramAccounts(new PublicKey(GM), bookArgs(ATLAS)).catch(() => []),
+    connection.getProgramAccounts(new PublicKey(GM), bookArgs(USDC)).catch(() => []),
+    connection.getProgramAccounts(new PublicKey(GM), bookArgs(POLIS)).catch(() => []),
     atlasCandles(),
+    krakenCandles("POLISUSD"),
+    poolCandles("2bnZ1edbvK3CK3LTNZ5jH9anvXYCmzPR4W2HQ6Ngsv5K"),
+    poolCandles("9xyCzsHi1wUWva7t5Z8eAvZDRmUCVhRrbaFfm3VbU4Mf"),
   ]);
 
-  const book = readBook(orders, atlasHex);
+  const book = readBook(orders, atlasHex, 8);
+  const usdcBook = readBook(usdcOrders, usdcHex, 6);
+  const polisBook = readBook(polisOrders, polisHex, 8);
 
   const resources: ResourceRow[] = [];
   const ships: ResourceRow[] = [];
   for (const item of nfts.values()) {
-    const side = book.get(item.mint);
-    if (item.kind === "resource" && CLASS_KEEP.has(item.className)) {
-      resources.push({
-        mint: item.mint,
-        name: item.name,
-        symbol: item.symbol,
-        className: item.className,
-        image: item.image,
-        ask: side?.ask ?? null,
-        bid: side?.bid ?? null,
-        askQty: side?.askQty ?? 0,
-      });
-    } else if (item.kind === "ship" && side && (side.ask != null || side.bid != null)) {
-      ships.push({
-        mint: item.mint,
-        name: item.name,
-        symbol: item.symbol,
-        className: item.className,
-        image: item.image,
-        ask: side.ask,
-        bid: side.bid,
-        askQty: side.askQty,
-      });
-    }
+    const atlasSide = book.get(item.mint);
+    const usdcSide = usdcBook.get(item.mint);
+    const polisSide = polisBook.get(item.mint);
+    const row: ResourceRow = {
+      mint: item.mint,
+      name: item.name,
+      symbol: item.symbol,
+      className: item.className,
+      image: item.image,
+      ask: usdcSide?.ask ?? null,
+      bid: usdcSide?.bid ?? null,
+      askQty: usdcSide?.askQty ?? 0,
+      quote: "USDC",
+      usdcAsk: usdcSide?.ask ?? null,
+      usdcBid: usdcSide?.bid ?? null,
+      atlasAsk: atlasSide?.ask ?? null,
+      atlasBid: atlasSide?.bid ?? null,
+      polisAsk: polisSide?.ask ?? null,
+      polisBid: polisSide?.bid ?? null,
+    };
+    if (item.kind === "resource" && CLASS_KEEP.has(item.className)) resources.push(row);
+    else if (item.kind === "ship") ships.push(row);
   }
   resources.sort((a, b) => a.name.localeCompare(b.name, "en"));
-  ships.sort((a, b) => (a.ask ?? 0) - (b.ask ?? 0));
+  ships.sort((a, b) => (a.usdcAsk == null ? 1 : 0) - (b.usdcAsk == null ? 1 : 0) || a.name.localeCompare(b.name, "en"));
+  const marketShips: MarketShip[] = [];
+  for (const item of nfts.values()) {
+    if (item.kind !== "ship") continue;
+    marketShips.push({
+      mint: item.mint,
+      name: item.name,
+      image: item.image,
+      gallery: item.gallery,
+      description: item.description,
+      rarity: item.rarity,
+      className: item.className,
+      spec: item.spec,
+      make: item.make,
+      crew: item.crew,
+      slots: item.slots,
+      msrp: item.msrp,
+      usdcAsks: usdcBook.get(item.mint)?.asks ?? [],
+      usdcBids: usdcBook.get(item.mint)?.bids ?? [],
+      atlasAsks: book.get(item.mint)?.asks ?? [],
+      atlasBids: book.get(item.mint)?.bids ?? [],
+    });
+  }
+  marketShips.sort((a, b) => a.className.localeCompare(b.className) || a.name.localeCompare(b.name, "en"));
 
   const atlas: TokenQuote = {
     ...emptyQuote(),
@@ -215,16 +325,23 @@ export async function buildMarket(): Promise<MarketSnap> {
     lockedSupply: num(polisTok?.lockedSupply),
   };
 
+  const chainPair = ratioCandles(polisPool, atlasPool);
+  const fallbackPair = ratioCandles(
+    polisCandles.map((row) => ({ ...row, t: Math.floor(row.t / 1000) })),
+    candles.map((row) => ({ ...row, t: Math.floor(row.t / 1000) })),
+  );
   const data: MarketSnap = {
     at: Date.now(),
     orderCount: orders.length,
     atlas,
     polis,
     resources,
-    ships: ships.slice(0, 40),
-    candles,
+    ships,
+    marketShips,
+    candles: atlasPool.length > 20 ? atlasPool : candles,
+    pairCandles: chainPair.length > 20 ? chainPair : fallbackPair,
     tape: pushTape([...resources, ...ships]),
-    note: "Свечи ATLAS — общий рынок MEXC, 4 часа. Это не ноль внутри браузера. Ресурсы: лучшая цена стакана Galactic Marketplace в ATLAS. У Galaxy нет истории стакана, поэтому Δ ресурсов копится общим снимком сервера. USD — Jupiter.",
+    note: "Корабли — каталог Galaxy. Стакан USDC считается с 6 знаками, ATLAS и POLIS с 8. Иначе 16 USDC выглядели как 0,16.",
   };
   marketCache = { at: Date.now(), data };
   return data;
@@ -237,7 +354,103 @@ function num(value: unknown): number | null {
 
 type ParsedToken = { mint: string; amount: number; decimals: number };
 
-async function rpc<T>(method: string, params: unknown[]): Promise<T> {
+type CrewCard = { mint: string; name: string; image: string; rarity: string; species: string; traits: WalletTrait[] };
+
+let crewCache: { at: number; byMint: Map<string, CrewCard> } | null = null;
+
+function oceanTrait(label: string, value: unknown): WalletTrait | null {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return { trait: label, value: String(n <= 1 ? Math.round(n * 100) : Math.round(n)) };
+}
+
+async function loadCrewCards(): Promise<Map<string, CrewCard>> {
+  if (crewCache && Date.now() - crewCache.at < CATALOG_TTL) return crewCache.byMint;
+  const rows = await getJson<Array<Record<string, unknown>>>("https://galaxy.staratlas.com/crew").catch(() => []);
+  const byMint = new Map<string, CrewCard>();
+  for (const row of rows) {
+    const mint = String(row.dasID ?? "");
+    if (!mint) continue;
+    const traits = [
+      oceanTrait("Openness", row.openness),
+      oceanTrait("Conscientiousness", row.conscientiousness),
+      oceanTrait("Extraversion", row.extraversion),
+      oceanTrait("Agreeableness", row.agreeableness),
+      oceanTrait("Neuroticism", row.neuroticism),
+    ].filter((trait): trait is WalletTrait => trait != null);
+    const aptitudes = row.aptitudes;
+    if (aptitudes && typeof aptitudes === "object") {
+      for (const [name, level] of Object.entries(aptitudes as Record<string, unknown>)) {
+        traits.push({ trait: name, value: String(level ?? "major") });
+      }
+    }
+    if (row.species) traits.push({ trait: "Species", value: String(row.species) });
+    byMint.set(mint, {
+      mint,
+      name: String(row.name ?? mint.slice(0, 4)),
+      image: String(row.imageUrl ?? ""),
+      rarity: String(row.rarity ?? ""),
+      species: String(row.species ?? ""),
+      traits,
+    });
+  }
+  crewCache = { at: Date.now(), byMint };
+  return byMint;
+}
+
+function crewItem(card: CrewCard, amount: number, image = "", traits: WalletTrait[] = []): WalletItem {
+  const layers = traits.filter((row) => /rarity/i.test(row.trait) || row.trait.toLowerCase() === "name");
+  const base = (card.traits.length ? card.traits : traits).filter((row) => !/rarity/i.test(row.trait) && row.trait.toLowerCase() !== "name");
+  const named = traits.find((row) => row.trait.toLowerCase() === "name")?.value;
+  const name = named && !/^crew\b/i.test(named) ? named : card.name;
+  return {
+    mint: card.mint,
+    amount,
+    name,
+    kind: "crew",
+    image: card.image || image,
+    className: "crew",
+    rarity: card.rarity,
+    spec: card.species,
+    traits: [...base, ...layers],
+  };
+}
+
+async function assetsOf(owner: string): Promise<Array<{ id: string; name: string; image: string; symbol: string; traits: WalletTrait[] }>> {
+  const out: Array<{ id: string; name: string; image: string; symbol: string; traits: WalletTrait[] }> = [];
+  for (let page = 1; page <= 3; page += 1) {
+    let result: { total?: number; items?: Array<Record<string, unknown>> };
+    try {
+      result = await rpc("getAssetsByOwner", {
+        ownerAddress: owner,
+        page,
+        limit: 100,
+        displayOptions: { showFungible: false, showZeroBalance: false },
+      });
+    } catch {
+      break;
+    }
+    const items = result.items ?? [];
+    for (const asset of items) {
+      const content = (asset.content ?? {}) as Record<string, unknown>;
+      const meta = (content.metadata ?? {}) as Record<string, unknown>;
+      const links = (content.links ?? {}) as Record<string, unknown>;
+      const id = String(asset.id ?? "");
+      if (!id) continue;
+      out.push({
+        id,
+        name: String(meta.name ?? ""),
+        image: typeof links.image === "string" ? links.image : "",
+        symbol: String(meta.symbol ?? ""),
+        traits: traitsFrom(meta),
+      });
+    }
+    if (!items.length || out.length >= (result.total ?? out.length)) break;
+  }
+  return out;
+}
+
+async function rpc<T>(method: string, params: unknown): Promise<T> {
   let last = "RPC не ответил";
   for (const url of RPCS) {
     try {
@@ -389,7 +602,7 @@ function traitsFrom(json: unknown): WalletTrait[] {
       if (!trait || value == null) continue;
       out.push({ trait, value: String(value) });
     }
-    return out.slice(0, 24);
+    return rankTraits(out);
   }
   if (raw && typeof raw === "object") {
     for (const [trait, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -397,13 +610,18 @@ function traitsFrom(json: unknown): WalletTrait[] {
       out.push({ trait, value: String(value) });
     }
   }
-  return out.slice(0, 24);
+  return rankTraits(out);
+}
+
+function rankTraits(out: WalletTrait[]): WalletTrait[] {
+  const important = (row: WalletTrait) => /rarity|^name$|species|sex|openness|conscient|extraver|agreeab|neurot|flight|command|engineer|medical|science|fitness|hospital|operator|university/i.test(row.trait);
+  return [...out.filter(important), ...out.filter((row) => !important(row))].slice(0, 48);
 }
 
 function isCrew(name: string, symbol: string, traits: WalletTrait[]): boolean {
   if (/crew/i.test(symbol) || /crew/i.test(name)) return true;
   const blob = traits.map((trait) => `${trait.trait} ${trait.value}`).join(" ").toLowerCase();
-  return /flight|command|engineering|hospitality|operator|medical|science|fitness|openness|conscient|extraver|agreeab|neurot|hair|species|ustur|punaab|sogmian|mierese/.test(
+  return /flight|command|engineering|hospitality|operator|medical|science|fitness|openness|conscient|extraver|agreeab|neurot|hair|species|aptitude|ustur|punaab|sogmian|mierese/.test(
     blob,
   );
 }
@@ -422,6 +640,40 @@ async function metaJson(uri: string): Promise<{ image: string; traits: WalletTra
   };
 }
 
+async function ownOrders(owner: string, catalog: Map<string, CatItem>): Promise<WalletItem[]> {
+  const rows = await rpc<Array<{ account?: { data?: [string, string] } }>>("getProgramAccounts", [
+    GM,
+    {
+      encoding: "base64",
+      dataSlice: { offset: 8, length: 160 },
+      filters: [{ dataSize: 201 }, { memcmp: { offset: 8, bytes: owner } }],
+    },
+  ]);
+  const out: WalletItem[] = [];
+  for (const row of rows) {
+    const raw = Buffer.from(row.account?.data?.[0] ?? "", "base64");
+    if (raw.length < 145) continue;
+    const asset = new PublicKey(raw.subarray(64, 96)).toBase58();
+    const side = raw[120];
+    const rem = Number(raw.readBigUInt64LE(137));
+    if (side !== 1 || rem <= 0) continue;
+    const known = catalog.get(asset);
+    if (known?.kind !== "ship") continue;
+    out.push({
+      mint: asset,
+      amount: rem,
+      name: known.name,
+      kind: "ship",
+      image: known.image,
+      className: "order",
+      rarity: known.rarity,
+      spec: "мой ордер",
+      traits: [],
+    });
+  }
+  return out;
+}
+
 export async function scanWallet(ownerText: string): Promise<WalletScan> {
   let owner: PublicKey;
   try {
@@ -429,7 +681,7 @@ export async function scanWallet(ownerText: string): Promise<WalletScan> {
   } catch {
     throw new Error("Это не публичный ключ Solana.");
   }
-  const catalog = await loadCatalog();
+  const [catalog, crewCards] = await Promise.all([loadCatalog(), loadCrewCards()]);
   const [heldPair, game] = await Promise.all([
     Promise.all([tokensOf(owner, TOKEN), tokensOf(owner, TOKEN_22)]),
     profilesOf(owner.toBase58()),
@@ -439,6 +691,11 @@ export async function scanWallet(ownerText: string): Promise<WalletScan> {
   const pending: ParsedToken[] = [];
 
   for (const token of held) {
+    const card = crewCards.get(token.mint);
+    if (card) {
+      items.push(crewItem(card, token.amount));
+      continue;
+    }
     const known = catalog.get(token.mint);
     if (known && known.kind !== "other") {
       items.push({
@@ -519,6 +776,41 @@ export async function scanWallet(ownerText: string): Promise<WalletScan> {
     items.push(...enriched);
   }
 
+  const seen = new Set(items.map((item) => item.mint));
+  const assets = await assetsOf(owner.toBase58()).catch(() => []);
+  for (const asset of assets) {
+    const card = crewCards.get(asset.id);
+    if (!card && !isCrew(asset.name, asset.symbol, asset.traits)) continue;
+    const row = card
+      ? crewItem(card, 1, asset.image, asset.traits)
+      : {
+          mint: asset.id,
+          amount: 1,
+          name: asset.name || asset.id.slice(0, 4) + "…" + asset.id.slice(-4),
+          kind: "crew" as const,
+          image: asset.image,
+          className: "crew",
+          rarity: asset.traits.find((trait) => trait.trait.toLowerCase() === "rarity")?.value || "",
+          spec: asset.traits.find((trait) => /species/i.test(trait.trait))?.value || "",
+          traits: asset.traits,
+        };
+    const existing = items.find((item) => item.mint === asset.id);
+    if (existing) {
+      existing.kind = "crew";
+      existing.name = row.name || existing.name;
+      existing.image = row.image || existing.image;
+      existing.traits = row.traits.length ? row.traits : existing.traits;
+      existing.rarity = asset.traits.find((trait) => trait.trait.toLowerCase() === "rarity")?.value || row.rarity || existing.rarity;
+      existing.spec = row.spec || existing.spec;
+      existing.className = "crew";
+    } else if (!seen.has(asset.id)) {
+      items.push(row);
+      seen.add(asset.id);
+    }
+  }
+
+  const listed = await ownOrders(owner.toBase58(), catalog).catch(() => []);
+  items.push(...listed);
   const order = { crew: 0, ship: 1, structure: 2, resource: 3, nft: 4, other: 5 };
   items.sort((a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name, "en"));
 
@@ -529,6 +821,6 @@ export async function scanWallet(ownerText: string): Promise<WalletScan> {
     skippedMeta,
     profiles: game.profiles,
     rpcWarning: game.warning,
-    note: "Подпись не нужна. Экипаж, который ещё на ключе, читается как NFT: символ, метадата и ipfs. Документация @staratlas/crew — это паки и погашение, не статы карточки. Статы в JSON NFT. Если человек уже в крио SAGE, на адресе его нет, пока не выведен из Starbase Inventory.",
+    note: "Экипаж с ключа собирается из инвентаря: карточки /crew по dasID и NFT, которые реестр Solana отдаёт как активы. OCEAN в каталоге — доля, здесь она приведена к 0–100. Если человек уже в Starbase, на адресе его нет.",
   };
 }

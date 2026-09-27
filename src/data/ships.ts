@@ -1,4 +1,5 @@
 import MEDIA from "./ship-media.json";
+import GALAXY from "./galaxy-ship-images.json";
 
 export const SHIP_SIZES = ["XX-Small", "X-Small", "Small", "Medium", "Large"] as const;
 export type ShipSize = (typeof SHIP_SIZES)[number];
@@ -310,7 +311,7 @@ export const SHIPS: ShipLine[] = ORDER.map((id) => {
     cargo: o.cargo ?? null,
     scan: o.scan ?? null,
     count: o.count,
-    images: m.images,
+    images: (GALAXY as Record<string, string>)[id] ? [(GALAXY as Record<string, string>)[id]] : [],
     note: o.note,
     hulls: o.hulls ?? [],
   };

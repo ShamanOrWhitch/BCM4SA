@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Galia Desk
  * Description: Полный экран Galia и стол цен. Шорткоды [galia_app] и [galia_desk]. Лабиринт не заменяет.
- * Version: 0.6.0
+ * Version: 0.8.1
  * Author: ShamanOrWitch
  * License: GPL-2.0-or-later
  */
@@ -13,6 +13,7 @@ if (!defined('ABSPATH')) {
 
 const GALIA_DESK_GM = 'traderDnaR5w6Tcoi3NFm53i48FTDNbGjBSZwWXDRrg';
 const GALIA_DESK_ATLAS = 'ATLASXmbPQxBUYbxPsV97usA3fPQYEqzQBUHgiFCUsXx';
+const GALIA_DESK_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const GALIA_DESK_POLIS = 'poLisWXnNRwC6oBu1vHiuKQzFjGL4XDSu4g9qjz9qVk';
 const GALIA_DESK_RPC = 'https://api.mainnet-beta.solana.com';
 
@@ -124,7 +125,7 @@ function galia_desk_rpc($method, $params, $timeout = 20) {
 }
 
 function galia_desk_catalog() {
-    $cached = get_transient('galia_desk_catalog');
+    $cached = get_transient('galia_desk_catalog_v2');
     if (is_array($cached)) {
         return $cached;
     }
@@ -138,18 +139,56 @@ function galia_desk_catalog() {
             continue;
         }
         $attrs = isset($row['attributes']) && is_array($row['attributes']) ? $row['attributes'] : array();
+        $media = isset($row['media']) && is_array($row['media']) ? $row['media'] : array();
+        $gallery = isset($media['gallery']) && is_array($media['gallery']) ? array_slice($media['gallery'], 0, 8) : array();
+        $slots = isset($row['slots']['crewSlots']) && is_array($row['slots']['crewSlots']) ? $row['slots']['crewSlots'] : array();
+        $crew = 0;
+        $slot_names = array();
+        foreach ($slots as $slot) {
+            if (!is_array($slot)) {
+                continue;
+            }
+            $n = isset($slot['quantity']) ? (int) $slot['quantity'] : 1;
+            $crew += $n;
+            $slot_names[] = (isset($slot['type']) ? $slot['type'] : 'слот') . ' ×' . $n;
+        }
+        $msrp = isset($row['tradeSettings']['msrp']['value']) ? $row['tradeSettings']['msrp']['value'] : null;
         $catalog[$row['mint']] = array(
             'name' => isset($row['name']) ? $row['name'] : $row['mint'],
             'symbol' => isset($row['symbol']) ? $row['symbol'] : '',
             'kind' => isset($attrs['itemType']) ? $attrs['itemType'] : 'other',
-            'className' => isset($attrs['class']) ? $attrs['class'] : '',
+            'className' => isset($attrs['class']) ? strtolower((string) $attrs['class']) : '',
             'rarity' => isset($attrs['rarity']) ? $attrs['rarity'] : '',
             'spec' => isset($attrs['spec']) ? $attrs['spec'] : '',
+            'make' => isset($attrs['make']) ? $attrs['make'] : '',
             'image' => isset($row['image']) ? $row['image'] : '',
+            'description' => isset($row['description']) ? $row['description'] : '',
+            'gallery' => $gallery,
+            'crew' => $crew,
+            'slots' => $slot_names,
+            'msrp' => is_numeric($msrp) ? (float) $msrp : null,
         );
     }
-    set_transient('galia_desk_catalog', $catalog, 30 * MINUTE_IN_SECONDS);
+    set_transient('galia_desk_catalog_v2', $catalog, 30 * MINUTE_IN_SECONDS);
     return $catalog;
+}
+
+function galia_desk_top($rows, $high_first) {
+    if (!is_array($rows)) {
+        return array();
+    }
+    usort($rows, function ($a, $b) use ($high_first) {
+        $av = isset($a['price']) ? (float) $a['price'] : 0;
+        $bv = isset($b['price']) ? (float) $b['price'] : 0;
+        if ($av === $bv) {
+            return 0;
+        }
+        if ($high_first) {
+            return ($av < $bv) ? 1 : -1;
+        }
+        return ($av > $bv) ? 1 : -1;
+    });
+    return array_slice($rows, 0, 8);
 }
 
 function galia_desk_market() {
@@ -171,11 +210,13 @@ function galia_desk_market() {
                 array('memcmp' => array('offset' => 40, 'bytes' => GALIA_DESK_ATLAS)),
             ),
         ),
-    ), 18);
+    ), 12);
 
     $asks = array();
     $bids = array();
     $qty = array();
+    $atlas_ask_lv = array();
+    $atlas_bid_lv = array();
     $order_count = 0;
     if (isset($book['result']) && is_array($book['result']) && (function_exists('gmp_init') || function_exists('bcadd'))) {
         $atlas_hex = bin2hex(galia_desk_b58_decode(GALIA_DESK_ATLAS));
@@ -198,17 +239,108 @@ function galia_desk_market() {
             if ($price <= 0 || $rem <= 0) {
                 continue;
             }
-            if ($side === 1 && (!isset($asks[$asset]) || $price < $asks[$asset])) {
-                $asks[$asset] = $price;
-                $qty[$asset] = $rem;
-            } elseif ($side === 0 && (!isset($bids[$asset]) || $price > $bids[$asset])) {
-                $bids[$asset] = $price;
+            if ($side === 1) {
+                $atlas_ask_lv[$asset][] = array('price' => $price, 'qty' => $rem);
+                if (!isset($asks[$asset]) || $price < $asks[$asset]) {
+                    $asks[$asset] = $price;
+                    $qty[$asset] = $rem;
+                }
+            } elseif ($side === 0) {
+                $atlas_bid_lv[$asset][] = array('price' => $price, 'qty' => $rem);
+                if (!isset($bids[$asset]) || $price > $bids[$asset]) {
+                    $bids[$asset] = $price;
+                }
+            }
+        }
+    }
+
+    $polis_book = galia_desk_rpc('getProgramAccounts', array(
+        GALIA_DESK_GM,
+        array(
+            'encoding' => 'base64',
+            'dataSlice' => array('offset' => 40, 'length' => 153),
+            'filters' => array(
+                array('dataSize' => 201),
+                array('memcmp' => array('offset' => 40, 'bytes' => GALIA_DESK_POLIS)),
+            ),
+        ),
+    ), 12);
+    $polis_asks = array();
+    $polis_bids = array();
+    if (isset($polis_book['result']) && is_array($polis_book['result']) && (function_exists('gmp_init') || function_exists('bcadd'))) {
+        $polis_hex = bin2hex(galia_desk_b58_decode(GALIA_DESK_POLIS));
+        foreach ($polis_book['result'] as $row) {
+            if (empty($row['account']['data'][0])) {
+                continue;
+            }
+            $raw = base64_decode($row['account']['data'][0]);
+            if (!is_string($raw) || strlen($raw) < 153 || bin2hex(substr($raw, 0, 32)) !== $polis_hex) {
+                continue;
+            }
+            $asset = galia_desk_b58encode(substr($raw, 32, 32));
+            $side = ord($raw[128]);
+            $price = galia_desk_u64(substr($raw, 129, 8)) / 100000000;
+            $rem = galia_desk_u64(substr($raw, 145, 8));
+            if ($price <= 0 || $rem <= 0) {
+                continue;
+            }
+            if ($side === 1 && (!isset($polis_asks[$asset]) || $price < $polis_asks[$asset])) {
+                $polis_asks[$asset] = $price;
+            } elseif ($side === 0 && (!isset($polis_bids[$asset]) || $price > $polis_bids[$asset])) {
+                $polis_bids[$asset] = $price;
+            }
+        }
+    }
+
+    $usdc = galia_desk_rpc('getProgramAccounts', array(
+        GALIA_DESK_GM,
+        array(
+            'encoding' => 'base64',
+            'dataSlice' => array('offset' => 40, 'length' => 153),
+            'filters' => array(
+                array('dataSize' => 201),
+                array('memcmp' => array('offset' => 40, 'bytes' => GALIA_DESK_USDC)),
+            ),
+        ),
+    ), 12);
+    $usdc_asks = array();
+    $usdc_bids = array();
+    $usdc_ask_lv = array();
+    $usdc_bid_lv = array();
+    if (isset($usdc['result']) && is_array($usdc['result']) && (function_exists('gmp_init') || function_exists('bcadd'))) {
+        $usdc_hex = bin2hex(galia_desk_b58_decode(GALIA_DESK_USDC));
+        foreach ($usdc['result'] as $row) {
+            if (empty($row['account']['data'][0])) {
+                continue;
+            }
+            $raw = base64_decode($row['account']['data'][0]);
+            if (!is_string($raw) || strlen($raw) < 153 || bin2hex(substr($raw, 0, 32)) !== $usdc_hex) {
+                continue;
+            }
+            $asset = galia_desk_b58encode(substr($raw, 32, 32));
+            $side = ord($raw[128]);
+            $price = galia_desk_u64(substr($raw, 129, 8)) / 1000000;
+            $rem = galia_desk_u64(substr($raw, 145, 8));
+            if ($price <= 0 || $rem <= 0) {
+                continue;
+            }
+            if ($side === 1) {
+                $usdc_ask_lv[$asset][] = array('price' => $price, 'qty' => $rem);
+                if (!isset($usdc_asks[$asset]) || $price < $usdc_asks[$asset]) {
+                    $usdc_asks[$asset] = $price;
+                }
+            } elseif ($side === 0) {
+                $usdc_bid_lv[$asset][] = array('price' => $price, 'qty' => $rem);
+                if (!isset($usdc_bids[$asset]) || $price > $usdc_bids[$asset]) {
+                    $usdc_bids[$asset] = $price;
+                }
             }
         }
     }
 
     $resources = array();
     $ships = array();
+    $market_ships = array();
     foreach ($catalog as $mint => $item) {
         $row = array(
             'mint' => $mint,
@@ -216,16 +348,42 @@ function galia_desk_market() {
             'symbol' => $item['symbol'],
             'className' => $item['className'],
             'image' => isset($item['image']) ? $item['image'] : '',
-            'ask' => isset($asks[$mint]) ? $asks[$mint] : null,
-            'bid' => isset($bids[$mint]) ? $bids[$mint] : null,
+            'usdcAsk' => isset($usdc_asks[$mint]) ? $usdc_asks[$mint] : null,
+            'usdcBid' => isset($usdc_bids[$mint]) ? $usdc_bids[$mint] : null,
+            'atlasAsk' => isset($asks[$mint]) ? $asks[$mint] : null,
+            'atlasBid' => isset($bids[$mint]) ? $bids[$mint] : null,
+            'polisAsk' => isset($polis_asks[$mint]) ? $polis_asks[$mint] : null,
+            'polisBid' => isset($polis_bids[$mint]) ? $polis_bids[$mint] : null,
+            'ask' => isset($usdc_asks[$mint]) ? $usdc_asks[$mint] : null,
+            'bid' => isset($usdc_bids[$mint]) ? $usdc_bids[$mint] : null,
             'askQty' => isset($qty[$mint]) ? $qty[$mint] : 0,
+            'quote' => 'USDC',
         );
-        if ($item['kind'] === 'resource' && $row['ask'] !== null) {
+        if ($item['kind'] === 'resource') {
             $resources[] = $row;
-        } elseif ($item['kind'] === 'ship' && ($row['ask'] !== null || $row['bid'] !== null)) {
+        } elseif ($item['kind'] === 'ship') {
             $ships[] = $row;
+            $market_ships[] = array(
+                'mint' => $mint,
+                'name' => $item['name'],
+                'image' => isset($item['image']) ? $item['image'] : '',
+                'gallery' => isset($item['gallery']) && is_array($item['gallery']) ? $item['gallery'] : array(),
+                'description' => isset($item['description']) ? $item['description'] : '',
+                'rarity' => isset($item['rarity']) ? $item['rarity'] : '',
+                'className' => isset($item['className']) ? $item['className'] : '',
+                'spec' => isset($item['spec']) ? $item['spec'] : '',
+                'make' => isset($item['make']) ? $item['make'] : '',
+                'crew' => isset($item['crew']) ? (int) $item['crew'] : 0,
+                'slots' => isset($item['slots']) && is_array($item['slots']) ? $item['slots'] : array(),
+                'msrp' => isset($item['msrp']) ? $item['msrp'] : null,
+                'usdcAsks' => galia_desk_top(isset($usdc_ask_lv[$mint]) ? $usdc_ask_lv[$mint] : array(), false),
+                'usdcBids' => galia_desk_top(isset($usdc_bid_lv[$mint]) ? $usdc_bid_lv[$mint] : array(), true),
+                'atlasAsks' => galia_desk_top(isset($atlas_ask_lv[$mint]) ? $atlas_ask_lv[$mint] : array(), false),
+                'atlasBids' => galia_desk_top(isset($atlas_bid_lv[$mint]) ? $atlas_bid_lv[$mint] : array(), true),
+            );
         }
     }
+
     usort($resources, function ($a, $b) {
         return strcasecmp($a['name'], $b['name']);
     });
@@ -245,19 +403,22 @@ function galia_desk_market() {
         }
     }
 
+    $atlas_candles = galia_desk_candles();
     $payload = array(
         'at' => time(),
         'orderCount' => $order_count,
         'atlas' => galia_desk_token($atlas, $prices, GALIA_DESK_ATLAS),
         'polis' => galia_desk_token($polis, $prices, GALIA_DESK_POLIS),
         'resources' => $resources,
-        'ships' => array_slice($ships, 0, 40),
-        'candles' => galia_desk_candles(),
+        'ships' => $ships,
+        'marketShips' => $market_ships,
+        'candles' => $atlas_candles,
+        'pairCandles' => galia_desk_cross(galia_desk_kraken('POLISUSD'), $atlas_candles),
         'tape' => galia_desk_push_tape(array_merge($resources, $ships)),
         'gmp' => function_exists('gmp_init') || function_exists('bcadd'),
     );
     if (!empty($resources)) {
-        set_transient('galia_desk_market', $payload, 10 * MINUTE_IN_SECONDS);
+        set_transient('galia_desk_market', $payload, 3 * MINUTE_IN_SECONDS);
     }
     return $payload;
 }
@@ -306,18 +467,25 @@ function galia_desk_b58_decode($text) {
     return str_repeat("\0", $zeros) . $bin;
 }
 
-function galia_desk_candles() {
-    $rows = galia_desk_remote_json('https://api.mexc.com/api/v3/klines?symbol=ATLASUSDT&interval=4h&limit=42');
+function galia_desk_kraken($pair) {
+    $data = galia_desk_remote_json('https://api.kraken.com/0/public/OHLC?pair=' . rawurlencode($pair) . '&interval=1440');
     $out = array();
-    if (!is_array($rows)) {
+    if (!is_array($data) || empty($data['result']) || !is_array($data['result'])) {
         return $out;
     }
+    $rows = array();
+    foreach ($data['result'] as $value) {
+        if (is_array($value) && isset($value[0]) && is_array($value[0])) {
+            $rows = $value;
+        }
+    }
+    $rows = array_slice($rows, -180);
     foreach ($rows as $row) {
         if (!is_array($row) || count($row) < 5) {
             continue;
         }
         $out[] = array(
-            't' => (int) $row[0],
+            't' => (int) $row[0] * 1000,
             'o' => (float) $row[1],
             'h' => (float) $row[2],
             'l' => (float) $row[3],
@@ -325,6 +493,56 @@ function galia_desk_candles() {
         );
     }
     return $out;
+}
+
+function galia_desk_cross($base, $quote) {
+    $by = array();
+    foreach ($quote as $row) {
+        $by[$row['t']] = $row;
+    }
+    $out = array();
+    foreach ($base as $row) {
+        if (!isset($by[$row['t']]) || $by[$row['t']]['c'] <= 0) {
+            continue;
+        }
+        $other = $by[$row['t']];
+        $o = $row['o'] / $other['o'];
+        $c = $row['c'] / $other['c'];
+        if ($o <= 0 || $c <= 0) {
+            continue;
+        }
+        $out[] = array(
+            't' => $row['t'],
+            'o' => $o,
+            'h' => max($row['h'] / max($other['h'], 0.0000001), $o, $c),
+            'l' => min($row['l'] / max($other['l'], 0.0000001), $o, $c),
+            'c' => $c,
+        );
+    }
+    return $out;
+}
+
+function galia_desk_candles() {
+    $atlas = galia_desk_kraken('ATLASUSD');
+    if (count($atlas) < 2) {
+        $rows = galia_desk_remote_json('https://api.mexc.com/api/v3/klines?symbol=ATLASUSDT&interval=4h&limit=48');
+        $atlas = array();
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                if (!is_array($row) || count($row) < 5) {
+                    continue;
+                }
+                $atlas[] = array(
+                    't' => (int) $row[0],
+                    'o' => (float) $row[1],
+                    'h' => (float) $row[2],
+                    'l' => (float) $row[3],
+                    'c' => (float) $row[4],
+                );
+            }
+        }
+    }
+    return $atlas;
 }
 
 function galia_desk_push_tape($resources) {
@@ -358,12 +576,95 @@ function galia_desk_token($supply, $prices, $mint) {
     );
 }
 
+function galia_desk_crew_index() {
+    $cached = get_transient('galia_desk_crew');
+    if (is_array($cached)) {
+        return $cached;
+    }
+    $rows = galia_desk_remote_json('https://galaxy.staratlas.com/crew');
+    $index = array();
+    if (is_array($rows)) {
+        foreach ($rows as $row) {
+            if (empty($row['dasID']) || !is_array($row)) {
+                continue;
+            }
+            $traits = array();
+            foreach (array(
+                'openness' => 'Openness',
+                'conscientiousness' => 'Conscientiousness',
+                'extraversion' => 'Extraversion',
+                'agreeableness' => 'Agreeableness',
+                'neuroticism' => 'Neuroticism',
+            ) as $key => $label) {
+                if (!isset($row[$key]) || !is_numeric($row[$key])) {
+                    continue;
+                }
+                $n = (float) $row[$key];
+                $traits[] = array('trait' => $label, 'value' => (string) ($n <= 1 ? (int) round($n * 100) : (int) round($n)));
+            }
+            if (!empty($row['aptitudes']) && is_array($row['aptitudes'])) {
+                foreach ($row['aptitudes'] as $name => $level) {
+                    $traits[] = array('trait' => (string) $name, 'value' => (string) $level);
+                }
+            }
+            if (!empty($row['species'])) {
+                $traits[] = array('trait' => 'Species', 'value' => (string) $row['species']);
+            }
+            $index[$row['dasID']] = array(
+                'name' => isset($row['name']) ? $row['name'] : $row['dasID'],
+                'image' => isset($row['imageUrl']) ? $row['imageUrl'] : '',
+                'rarity' => isset($row['rarity']) ? $row['rarity'] : '',
+                'species' => isset($row['species']) ? $row['species'] : '',
+                'traits' => $traits,
+            );
+        }
+    }
+    set_transient('galia_desk_crew', $index, 30 * MINUTE_IN_SECONDS);
+    return $index;
+}
+
+function galia_desk_is_crew($name, $symbol, $traits) {
+    if (stripos($name, 'crew') !== false || stripos($symbol, 'crew') !== false) {
+        return true;
+    }
+    $blob = '';
+    foreach ($traits as $trait) {
+        $blob .= ' ' . ($trait['trait'] ?? '') . ' ' . ($trait['value'] ?? '');
+    }
+    return (bool) preg_match('/flight|command|engineering|hospitality|operator|medical|science|fitness|openness|species|aptitude|ustur|punaab|sogmian|mierese|hair/i', $blob);
+}
+
+function galia_desk_assets($owner) {
+    $out = array();
+    for ($page = 1; $page <= 3; $page++) {
+        $json = galia_desk_rpc('getAssetsByOwner', array(
+            'ownerAddress' => $owner,
+            'page' => $page,
+            'limit' => 100,
+            'displayOptions' => array('showFungible' => false, 'showZeroBalance' => false),
+        ), 15);
+        $chunk = isset($json['result']['items']) && is_array($json['result']['items']) ? $json['result']['items'] : array();
+        if (!$chunk) {
+            break;
+        }
+        foreach ($chunk as $asset) {
+            $out[] = $asset;
+        }
+        $total = isset($json['result']['total']) ? (int) $json['result']['total'] : count($out);
+        if (count($out) >= $total) {
+            break;
+        }
+    }
+    return $out;
+}
+
 function galia_desk_wallet($owner) {
     $owner = trim($owner);
     if (!preg_match('/^[1-9A-HJ-NP-Za-km-z]{32,44}$/', $owner)) {
         return new WP_Error('galia_owner', 'Нужен публичный ключ Solana.');
     }
     $catalog = galia_desk_catalog();
+    $crew_index = galia_desk_crew_index();
     $items = array();
     foreach (array('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb') as $program) {
         $json = galia_desk_rpc('getTokenAccountsByOwner', array($owner, array('programId' => $program), array('encoding' => 'jsonParsed')));
@@ -378,6 +679,22 @@ function galia_desk_wallet($owner) {
                 continue;
             }
             $mint = $info['mint'];
+            if (isset($crew_index[$mint])) {
+                $card = $crew_index[$mint];
+                $items[] = array(
+                    'mint' => $mint,
+                    'amount' => $amount,
+                    'name' => $card['name'],
+                    'kind' => 'crew',
+                    'className' => 'crew',
+                    'rarity' => $card['rarity'],
+                    'spec' => $card['species'],
+                    'image' => $card['image'],
+                    'video' => '',
+                    'traits' => $card['traits'],
+                );
+                continue;
+            }
             $decimals = isset($info['tokenAmount']['decimals']) ? (int) $info['tokenAmount']['decimals'] : 0;
             $known = isset($catalog[$mint]) ? $catalog[$mint] : null;
             $currency = null;
@@ -407,12 +724,105 @@ function galia_desk_wallet($owner) {
             );
         }
     }
+    $seen = array();
+    foreach ($items as $index => $item) {
+        $seen[$item['mint']] = $index;
+    }
+    foreach (galia_desk_assets($owner) as $asset) {
+        if (empty($asset['id'])) {
+            continue;
+        }
+        $mint = $asset['id'];
+        $meta = isset($asset['content']['metadata']) && is_array($asset['content']['metadata']) ? $asset['content']['metadata'] : array();
+        $links = isset($asset['content']['links']) && is_array($asset['content']['links']) ? $asset['content']['links'] : array();
+        $traits = array();
+        if (!empty($meta['attributes']) && is_array($meta['attributes'])) {
+            foreach ($meta['attributes'] as $trait) {
+                if (!is_array($trait) || empty($trait['trait_type']) || !isset($trait['value'])) {
+                    continue;
+                }
+                $traits[] = array('trait' => (string) $trait['trait_type'], 'value' => (string) $trait['value']);
+            }
+        }
+        $trait_rarity = '';
+        foreach ($traits as $trait) {
+            if (isset($trait['trait']) && strcasecmp((string) $trait['trait'], 'rarity') === 0) {
+                $trait_rarity = (string) $trait['value'];
+            }
+        }
+        $card = isset($crew_index[$mint]) ? $crew_index[$mint] : null;
+        $name = $card ? $card['name'] : (isset($meta['name']) ? $meta['name'] : '');
+        $symbol = isset($meta['symbol']) ? $meta['symbol'] : '';
+        if (!$card && !galia_desk_is_crew($name, $symbol, $traits)) {
+            continue;
+        }
+        $row = array(
+            'mint' => $mint,
+            'amount' => 1,
+            'name' => $name ? $name : $mint,
+            'kind' => 'crew',
+            'className' => 'crew',
+            'rarity' => $trait_rarity !== '' ? $trait_rarity : ($card ? $card['rarity'] : ''),
+            'spec' => $card ? $card['species'] : '',
+            'image' => $card && $card['image'] ? $card['image'] : (isset($links['image']) ? $links['image'] : ''),
+            'video' => '',
+            'traits' => $card && !empty($card['traits']) ? $card['traits'] : $traits,
+        );
+        if (isset($seen[$mint])) {
+            $prev = $items[$seen[$mint]];
+            $row['amount'] = $prev['amount'];
+            $items[$seen[$mint]] = $row;
+        } else {
+            $seen[$mint] = count($items);
+            $items[] = $row;
+        }
+    }
+    $order_rows = galia_desk_rpc('getProgramAccounts', array(
+        GALIA_DESK_GM,
+        array(
+            'encoding' => 'base64',
+            'dataSlice' => array('offset' => 8, 'length' => 160),
+            'filters' => array(
+                array('dataSize' => 201),
+                array('memcmp' => array('offset' => 8, 'bytes' => $owner)),
+            ),
+        ),
+    ), 12);
+    if (isset($order_rows['result']) && is_array($order_rows['result'])) {
+        foreach ($order_rows['result'] as $row) {
+            if (empty($row['account']['data'][0])) {
+                continue;
+            }
+            $raw = base64_decode($row['account']['data'][0]);
+            if (!is_string($raw) || strlen($raw) < 145 || ord($raw[120]) !== 1) {
+                continue;
+            }
+            $asset = galia_desk_b58encode(substr($raw, 64, 32));
+            $rem = galia_desk_u64(substr($raw, 137, 8));
+            if ($rem <= 0 || empty($catalog[$asset]) || $catalog[$asset]['kind'] !== 'ship') {
+                continue;
+            }
+            $known = $catalog[$asset];
+            $items[] = array(
+                'mint' => $asset,
+                'amount' => $rem,
+                'name' => $known['name'],
+                'kind' => 'ship',
+                'className' => 'order',
+                'rarity' => $known['rarity'],
+                'spec' => 'мой ордер',
+                'image' => isset($known['image']) ? $known['image'] : '',
+                'video' => '',
+                'traits' => array(),
+            );
+        }
+    }
     $game = galia_desk_game($owner);
     return array(
         'owner' => $owner,
         'items' => $items,
         'profiles' => $game['profiles'],
-        'note' => 'Подпись не нужна: адрес публичный. Пустой список на ключе значит, что корабли и груз уже в SAGE, не в кошельке. '
+        'note' => 'Экипаж снят с инвентаря ключа: официальные карточки Galaxy и NFT, которые реестр помечает как crew. Если человек уже в Starbase, на адресе его нет. '
             . $game['note'],
     );
 }
@@ -581,9 +991,9 @@ function galia_desk_shortcode() {
           }).join("");
           var tape = data.tape || [];
           var prev = tape.length >= 2 ? tape[tape.length - 2].asks || {} : {};
-          root.querySelector("[data-galia-chart]").innerHTML = candlesSvg(data.candles || []) + bubblesHtml("Ресурсы", data.resources || [], prev) + bubblesHtml("Корабли", data.ships || [], prev);
+          root.querySelector("[data-galia-chart]").innerHTML = candlesSvg("POLIS / ATLAS · 1д", data.pairCandles || []) + candlesSvg("ATLAS / USD · 1д", data.candles || []) + bubblesHtml("Ресурсы и сырьё · ATLAS", data.resources || [], prev) + bubblesHtml("Корабли", data.ships || [], prev);
           var rows = (data.resources || []).filter(function (row) { return row.ask != null; });
-          var html = '<table><thead><tr><th>Ресурс</th><th>Класс</th><th>Продажа</th><th>Покупка</th><th>Δ</th></tr></thead><tbody>';
+          var html = '<table><thead><tr><th>Ресурс</th><th>Класс</th><th>Продажа, ATLAS</th><th>Покупка, ATLAS</th><th>Δ</th></tr></thead><tbody>';
           rows.forEach(function (row) {
             var d = "—";
             if (prev[row.mint]) {
@@ -594,10 +1004,10 @@ function galia_desk_shortcode() {
           });
           root.querySelector("[data-galia-table]").innerHTML = html + '</tbody></table>';
           var tapeNote = tape.length < 2 ? " Первый общий снимок ресурсов записан на сайте." : " Снимков ресурса на сайте: " + tape.length + ".";
-          status.textContent = (data.gmp === false ? "На сервере нет GMP — цены стакана не посчитались." : ("Ордеров " + (data.orderCount || 0))) + tapeNote;
+          status.textContent = (data.gmp === false ? "На сервере нет GMP — цены стакана не посчитались." : ("Ордеров " + (data.orderCount || 0))) + tapeNote + " · авто 3 мин";
         }
         function bubblesHtml(title, rows, prev) {
-          var priced = (rows || []).filter(function (row) { return row.ask != null; }).slice(0, 36);
+          var priced = (rows || []).filter(function (row) { return row.image || row.usdcAsk != null || row.ask != null; }).slice(0, 60);
           if (!priced.length) return "";
           var html = '<div class="galia-desk-card"><strong>' + title + '</strong><div style="display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.5rem">';
           priced.forEach(function (row) {
@@ -608,7 +1018,7 @@ function galia_desk_shortcode() {
               change = (pct > 0 ? "+" : "") + pct.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
               color = pct > 0 ? "#c45c4a" : "#7a9a7e";
             } else {
-              change = num(row.ask);
+              change = num(row.usdcAsk != null ? row.usdcAsk : row.ask) + " USDC";
             }
             var size = 74 + Math.min(48, Math.log10((row.askQty || 1) + 10) * 16);
             html += '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:999px;border:1px solid ' + color + ';display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:.25rem">';
@@ -617,16 +1027,22 @@ function galia_desk_shortcode() {
           });
           return html + '</div></div>';
         }
-        function candlesSvg(candles) {
+        function candlesSvg(title, candles) {
           if (!candles || candles.length < 2) return "";
-          var w = 640, h = 96, pad = 6;
+          var w = 640, h = 160, pad = 8, padR = 72;
           var min = candles[0].l, max = candles[0].h;
           candles.forEach(function (c) { if (c.l < min) min = c.l; if (c.h > max) max = c.h; });
           var span = (max - min) || 1;
-          var slot = (w - pad * 2) / candles.length;
+          var slot = (w - pad - padR) / candles.length;
           function y(v) { return pad + (1 - (v - min) / span) * (h - pad * 2); }
-          var first = candles[0].o, last = candles[candles.length - 1].c;
-          var move = first ? ((last - first) / first) * 100 : 0;
+          function tick(n) { return n >= 100 ? n.toFixed(1) : n >= 1 ? n.toFixed(2) : n.toFixed(6); }
+          var last = candles[candles.length - 1];
+          var first = candles[0].o;
+          var move = first ? ((last.c - first) / first) * 100 : 0;
+          var grid = [max, (max + min) / 2, min].map(function (v) {
+            return '<line x1="' + pad + '" x2="' + (w - padR) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="rgba(232,238,242,.12)"/>'
+              + '<text x="' + (w - 4) + '" y="' + (y(v) + 4) + '" text-anchor="end" fill="#8b96a3" font-size="12">' + tick(v) + '</text>';
+          }).join("");
           var body = candles.map(function (c, i) {
             var x = pad + i * slot + slot / 2;
             var up = c.c >= c.o;
@@ -636,7 +1052,9 @@ function galia_desk_shortcode() {
             return '<line x1="' + x + '" x2="' + x + '" y1="' + y(c.h) + '" y2="' + y(c.l) + '" stroke="' + color + '" stroke-width="1.2"/>'
               + '<rect x="' + (x - Math.max(1.2, slot * 0.28)) + '" y="' + top + '" width="' + Math.max(2, slot * 0.56) + '" height="' + Math.max(1.2, bot - top) + '" fill="' + color + '"/>';
           }).join("");
-          return '<div class="galia-desk-card"><strong>ATLAS · свечи 4ч</strong> ' + move.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + '%<svg viewBox="0 0 ' + w + ' ' + h + '" style="width:100%;height:96px;display:block;margin-top:.4rem">' + body + '</svg><span class="galia-desk-note">Общий рынок MEXC.</span></div>';
+          return '<div class="galia-desk-card"><strong>' + title + '</strong> ' + move.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + '%'
+            + ' <span class="galia-desk-note">O ' + tick(last.o) + ' H ' + tick(last.h) + ' L ' + tick(last.l) + ' C ' + tick(last.c) + '</span>'
+            + '<svg viewBox="0 0 ' + w + ' ' + h + '" style="width:100%;height:160px;display:block;margin-top:.4rem">' + grid + body + '</svg></div>';
         }
         function load() {
           status.textContent = "Снимаю стакан…";
@@ -646,6 +1064,13 @@ function galia_desk_shortcode() {
           }).catch(function () { status.textContent = "Не вышло снять цены."; });
         }
         root.querySelector("[data-galia-refresh]").addEventListener("click", load);
+        window.setInterval(function () {
+          if (document.hidden) return;
+          load();
+        }, 3 * 60 * 1000);
+        document.addEventListener("visibilitychange", function () {
+          if (!document.hidden) load();
+        });
         root.querySelector("[data-galia-wallet]").addEventListener("submit", function (event) {
           event.preventDefault();
           var owner = new FormData(event.currentTarget).get("owner");
@@ -653,7 +1078,12 @@ function galia_desk_shortcode() {
           hold.textContent = "Читаю кошелёк…";
           post("galia_desk_wallet", { owner: owner }).then(function (res) { return res.json(); }).then(function (json) {
             if (!json.success) throw new Error((json.data && json.data.message) || "wallet");
-            var items = json.data.items || [];
+            var items = (json.data.items || []).slice().sort(function (a, b) {
+              var rank = { Anomaly: 0, Legendary: 1, Epic: 2, Rare: 3, Uncommon: 4, Common: 5 };
+              var ar = a.kind === "crew" ? (rank[a.rarity] == null ? 9 : rank[a.rarity]) : 20;
+              var br = b.kind === "crew" ? (rank[b.rarity] == null ? 9 : rank[b.rarity]) : 20;
+              return ar - br;
+            });
             var profiles = json.data.profiles || [];
             var html = profiles.map(function (profile) {
               var fleets = (profile.fleets || []).map(function (fleet) {
@@ -662,9 +1092,16 @@ function galia_desk_shortcode() {
               return '<div class="galia-desk-card"><strong>В игре</strong><br>' + profile.profile + '<br>' + fleets + '</div>';
             }).join("");
             html += items.map(function (item) {
-              var media = item.image ? '<img alt="" src="' + item.image + '" style="width:48px;height:48px;object-fit:cover;border-radius:8px;margin-right:.5rem" />' : '';
-              var clip = item.video ? '<video controls playsinline src="' + item.video + '" style="width:100%;max-height:180px;margin-top:.4rem"></video>' : '';
-              return '<div class="galia-desk-card" style="display:flex;gap:.5rem;align-items:flex-start">' + media + '<div><strong>' + item.name + '</strong> ×' + num(item.amount) + ' · ' + item.kind + (item.spec ? ' · ' + item.spec : '') + clip + '</div></div>';
+              var media = item.image ? '<img alt="" src="' + item.image + '" style="width:72px;height:72px;object-fit:cover;border-radius:8px" />' : '';
+              var jobs = (item.traits || []).filter(function (trait) {
+                return /flight|command|engineering|medical|science|fitness|hospitality|operator/i.test(trait.trait);
+              }).map(function (trait) {
+                return trait.trait + " " + (/minor|25/i.test(String(trait.value)) ? "minor" : "major");
+              }).join(" · ");
+              var line = item.kind === "crew"
+                ? ((item.rarity || "") + (jobs ? " · " + jobs : ""))
+                : ("×" + num(item.amount) + (item.spec === "мой ордер" ? " · в продаже" : "") + (item.quote ? " · " + item.quote : ""));
+              return '<div class="galia-desk-card" style="display:flex;gap:.6rem;align-items:flex-start">' + media + '<div><strong>' + item.name + '</strong><div>' + line + '</div></div></div>';
             }).join("");
             if (!items.length) html += "<p>На ключе нет токенов Star Atlas. Подпись это не лечит: груз игры и экипаж в крио SAGE лежат не на адресе.</p>";
             hold.innerHTML = html;
@@ -760,12 +1197,14 @@ function galia_desk_globe_markup($full = false) {
     ?>
     <div id="galia-root" style="min-height:<?php echo esc_attr($height); ?>;background:#07090e"></div>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Rajdhani:wght@500;600;700&family=Source+Sans+3:wght@400;500;600&display=swap" />
-    <link rel="stylesheet" href="<?php echo esc_url($base . 'app.css?ver=0.6.0'); ?>" />
+    <link rel="stylesheet" href="<?php echo esc_url($base . 'app.css?ver=0.8.1'); ?>" />
+    <!-- noptimize -->
     <script>
       window.GALIA_ASSET = <?php echo wp_json_encode($base); ?>;
       window.GALIA_WP = <?php echo wp_json_encode(array('ajax' => $ajax, 'nonce' => $nonce)); ?>;
     </script>
-    <script src="<?php echo esc_url($base . 'app.js?ver=0.6.0'); ?>"></script>
+    <script type="module" src="<?php echo esc_url($base . 'app.js?ver=0.8.1'); ?>"></script>
+    <!-- /noptimize -->
     <?php
     return ob_get_clean();
 }
